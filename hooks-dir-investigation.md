@@ -192,6 +192,59 @@ if strictMode && errors.Is(err, os.ErrNotExist) {
 3. It's consistent with Podman's design philosophy of being permissive but informative
 4. Similar behavior exists in line 2444 where deprecated implicit hook directories show warnings
 
+## Relative Path Support
+
+### Question: Does --hooks-dir support relative paths?
+
+**Short answer:** Yes, but with caveats that may cause unexpected behavior.
+
+### How Relative Paths Work
+
+1. **No Path Normalization:** The code does not convert relative paths to absolute paths anywhere in the flow:
+   - `cmd/podman/root.go:595-597` - Flag accepts raw string values
+   - `libpod/options.go:266-268` - Only checks for empty strings
+   - `vendor/.../hooks/read.go:66` - Passes path directly to `os.ReadDir(path)`
+
+2. **Resolution Timing:** Relative paths are resolved by `os.ReadDir()` relative to the **current working directory** at the time hooks are loaded (during container creation).
+
+3. **Code Evidence:**
+```go
+// vendor/go.podman.io/common/pkg/hooks/read.go:64-69
+func ReadDir(path string, extensionStages []string, hooks map[string]*current.Hook) error {
+    logrus.Debugf("reading hooks from %s", path)
+    files, err := os.ReadDir(path)  // Uses path as-is
+    if err != nil {
+        return err
+    }
+```
+
+### Potential Issues with Relative Paths
+
+1. **Working Directory Dependent:** The hooks directory resolution depends on where `podman` is invoked from:
+   ```bash
+   cd /home/user
+   podman run --hooks-dir=./hooks alpine echo test  # Looks for /home/user/hooks
+
+   cd /tmp
+   podman run --hooks-dir=./hooks alpine echo test  # Looks for /tmp/hooks
+   ```
+
+2. **No Validation:** Combined with the lack of path existence validation, users might not realize their hooks aren't being loaded:
+   ```bash
+   podman run --hooks-dir=./hooks alpine echo test
+   # Silently succeeds even if ./hooks doesn't exist
+   ```
+
+3. **Container Restart:** If containers are restarted from a different working directory, the relative path may resolve differently.
+
+### Documentation Status
+
+The documentation (`docs/source/markdown/podman.1.md:62`) describes `--hooks-dir=*path*` but does not specify whether paths should be absolute or relative.
+
+### Recommendation
+
+For production use, **always use absolute paths** with `--hooks-dir` to avoid working-directory-dependent behavior. The lack of path validation makes debugging relative path issues difficult.
+
 ## Related Code Locations
 
 - Flag definition: `cmd/podman/root.go:595-597`
@@ -201,11 +254,14 @@ if strictMode && errors.Is(err, os.ErrNotExist) {
 - Hook loading: `libpod/container_internal.go:2427-2458`
 - Hook manager: `vendor/go.podman.io/common/pkg/hooks/hooks.go:51-66`
 - Directory reading: `vendor/go.podman.io/common/pkg/hooks/read.go:64-94`
+- Path type storage: `vendor/go.podman.io/common/internal/attributedstring/slice.go:32-42`
 
 ## Test Coverage
 
 Existing tests:
 - `test/system/030-run.bats:1546` - Tests hooks are preserved on restart
-- `test/e2e/run_test.go:932` - Tests hooks with comma in directory name
+- `test/e2e/run_test.go:932` - Tests hooks with comma in directory name (uses absolute paths)
 
-**Missing test:** No test verifies behavior with invalid/non-existent hooks directories.
+**Missing tests:**
+- No test verifies behavior with invalid/non-existent hooks directories
+- No test validates relative path behavior
