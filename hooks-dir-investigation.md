@@ -245,6 +245,156 @@ The documentation (`docs/source/markdown/podman.1.md:62`) describes `--hooks-dir
 
 For production use, **always use absolute paths** with `--hooks-dir` to avoid working-directory-dependent behavior. The lack of path validation makes debugging relative path issues difficult.
 
+---
+
+## Shell Expansion in Hook Path Property
+
+### Question: Does the hook.path property support shell notation like tilde (~) or environment variables ($HOME)?
+
+**Short answer:** No. The hook path does not support any shell expansion.
+
+### How Hook Paths Are Processed
+
+The hook path is treated as a **literal string** throughout the entire processing pipeline:
+
+1. **JSON Parsing** (`vendor/.../hooks/1.0.0/hook.go:26-30`):
+```go
+func Read(content []byte) (hook *Hook, err error) {
+    if err = json.Unmarshal(content, &hook); err != nil {
+        return nil, err
+    }
+    return hook, nil
+}
+```
+The path is extracted from JSON as a plain string with no expansion.
+
+2. **Path Validation** (`vendor/.../hooks/1.0.0/hook.go:47-49`):
+```go
+if err := fileutils.Exists(hook.Hook.Path); err != nil {
+    return err
+}
+```
+The path is checked for existence **as-is** using `unix.Faccessat()` or `os.Stat()`, which do not perform shell expansion.
+
+3. **Hook Execution** (`vendor/.../hooks/exec/exec.go:55-63`):
+```go
+cmd := osexec.Cmd{
+    Path:   hook.Path,  // Used directly
+    Args:   hook.Args,
+    Env:    hook.Env,
+    // ...
+}
+```
+The path is passed directly to Go's `os/exec.Cmd.Path`, which expects an **absolute path** or a path relative to the current working directory. Go's `os/exec` does **not** perform shell expansion.
+
+### What This Means
+
+**These will NOT work:**
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "~/hooks/my-hook.sh"        // ❌ Tilde not expanded
+  }
+}
+```
+
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "$HOME/hooks/my-hook.sh"    // ❌ Variable not expanded
+  }
+}
+```
+
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "${HOME}/hooks/my-hook.sh"  // ❌ Variable not expanded
+  }
+}
+```
+
+**These WILL work:**
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/home/user/hooks/my-hook.sh"  // ✅ Absolute path
+  }
+}
+```
+
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/usr/local/bin/my-hook"       // ✅ Absolute path
+  }
+}
+```
+
+### Why No Shell Expansion?
+
+1. **OCI Runtime Spec**: The `Hook` struct in the OCI runtime specification defines `Path` as a simple string field (`vendor/.../runtime-spec/specs-go/config.go:189`):
+```go
+type Hook struct {
+    Path    string   `json:"path"`
+    Args    []string `json:"args,omitempty"`
+    Env     []string `json:"env,omitempty"`
+    Timeout *int     `json:"timeout,omitempty"`
+}
+```
+
+2. **Direct Execution**: Go's `os/exec` package executes binaries directly without invoking a shell, so shell features like tilde expansion or variable substitution are not available.
+
+3. **Security**: Avoiding shell expansion reduces attack surface and prevents unintended variable expansion.
+
+### Test Evidence
+
+All existing tests use absolute paths:
+- `test/system/030-run.bats:1559`: Uses `"path": "$hooksdir/hook.sh"` - but the `$hooksdir` is expanded **by the shell when creating the JSON file**, not by Podman
+- `test/e2e/run_test.go:943`: Uses `fmt.Sprintf` to inject absolute paths into the JSON before writing it
+
+### Workarounds
+
+If you need to use environment variables, expand them **before** creating the hook JSON:
+
+**Option 1: Shell substitution when creating the file**
+```bash
+cat > /etc/containers/oci/hooks.d/my-hook.json <<EOF
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "${HOME}/hooks/my-hook.sh"
+  },
+  "stages": ["prestart"]
+}
+EOF
+```
+
+**Option 2: Template processing**
+```bash
+envsubst < my-hook.json.template > /etc/containers/oci/hooks.d/my-hook.json
+```
+
+**Option 3: Always use absolute paths**
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/usr/local/bin/my-hook"
+  },
+  "stages": ["prestart"]
+}
+```
+
+### Recommendation
+
+**Always use absolute paths** in hook JSON files. This avoids any ambiguity and ensures the hook binary can be found regardless of the current working directory.
+
 ## Related Code Locations
 
 - Flag definition: `cmd/podman/root.go:595-597`
