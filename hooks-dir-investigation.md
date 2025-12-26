@@ -395,6 +395,104 @@ envsubst < my-hook.json.template > /etc/containers/oci/hooks.d/my-hook.json
 
 **Always use absolute paths** in hook JSON files. This avoids any ambiguity and ensures the hook binary can be found regardless of the current working directory.
 
+---
+
+## Compatibility with Podman Compose
+
+### Question: Does --hooks-dir work with podman compose?
+
+**Short answer:** No, the `--hooks-dir` global flag does NOT work with `podman compose`.
+
+### Why It Doesn't Work
+
+`podman compose` is fundamentally different from other podman commands:
+
+1. **External Provider Architecture** (`cmd/podman/compose.go:24-29`):
+   - `podman compose` is a **thin wrapper** that executes an external binary
+   - Default providers are `docker-compose` or `podman-compose`
+   - It's not a native podman command that directly creates containers
+
+2. **Command Flow**:
+   ```
+   podman --hooks-dir=/path compose up
+        ↓
+   Global flag parsed and stored in process memory
+        ↓
+   Spawns external process: docker-compose up
+        ↓
+   docker-compose makes API calls to podman socket
+        ↓
+   API server creates containers (NO access to --hooks-dir from client)
+   ```
+
+3. **API Communication** (`cmd/podman/compose.go:157-170`):
+   ```go
+   return []string{
+       "DOCKER_HOST=" + hostValue,  // Socket path passed to provider
+       "DOCKER_BUILDKIT=0",
+       "DOCKER_CONFIG=" + os.Getenv("DOCKER_CONFIG"),
+   }, nil
+   ```
+   The compose provider communicates with Podman via API calls, not direct execution.
+
+4. **Separate Processes**:
+   - The `--hooks-dir` flag is stored in the podman client process memory
+   - The external compose provider runs as a separate process
+   - API calls don't include the `--hooks-dir` setting
+   - The API server uses its own configuration (from `containers.conf`)
+
+### Code Evidence
+
+**Flag Parsing Disabled** (`cmd/podman/compose.go:34`):
+```go
+DisableFlagParsing: true,
+```
+The compose command doesn't parse flags - it passes them to the external provider.
+
+**Direct Execution** (`cmd/podman/compose.go:209-214`):
+```go
+cmd := exec.Command(provider, args...)
+cmd.Stdin = os.Stdin
+cmd.Stdout = stdout
+cmd.Stderr = stderr
+cmd.Env = append(os.Environ(), env...)
+```
+Arguments are passed directly to the external provider without podman processing them.
+
+### How to Use Hooks with Podman Compose
+
+Since `--hooks-dir` doesn't work, use these alternatives:
+
+**Option 1: Configure in containers.conf (Recommended)**
+```toml
+# /etc/containers/containers.conf or ~/.config/containers/containers.conf
+[engine]
+hooks_dir = ["/path/to/hooks"]
+```
+This applies to all podman operations, including compose.
+
+**Option 2: Use environment variable (if supported)**
+Some compose providers may support passing podman-specific settings, but this is provider-dependent.
+
+**Option 3: Start podman service with --hooks-dir**
+If you're running a podman service manually:
+```bash
+podman system service --hooks-dir=/path/to/hooks unix:///run/podman/podman.sock
+```
+Then use compose normally.
+
+### Test Evidence
+
+No tests exist for compose + hooks integration, which supports the conclusion that this combination is not supported or tested.
+
+### Documentation Status
+
+The `podman-compose` documentation (`docs/source/markdown/podman-compose.1.md.in`) does not mention global flags or hooks support. It only states that arguments are "passed directly to the compose provider."
+
+### Recommendation
+
+**Configure hooks in `containers.conf`** rather than using the `--hooks-dir` flag when working with podman compose. This ensures hooks are available regardless of how containers are created.
+
 ## Related Code Locations
 
 - Flag definition: `cmd/podman/root.go:595-597`
